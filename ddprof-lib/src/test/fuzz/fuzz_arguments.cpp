@@ -92,6 +92,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // not correct error handling. Invalid arguments should return an
         // error, not crash.
         (void)error;
+
+        // Exercise the post-parse accessors that production code drives, not
+        // just parse() itself. These are the higher-risk surfaces:
+        //
+        // file() -> expandFilePattern(): snprintf()s %p / %t / %{ENV} tokens
+        // into a fixed-size buffer using environment-controlled content. Only
+        // invoked when the parsed file pattern contains '%'. This is the main
+        // coverage gap and the most security-relevant path in the parser.
+        const char *expanded = arguments.file();
+        (void)expanded;
+
+        // save() copies the parsed configuration into a second instance (the
+        // profiler persists the active config this way), exercising the
+        // assignment and shared-buffer (_shared) handling.
+        Arguments saved;
+        arguments.save(saved);
     } catch (...) {
         // Unexpected exceptions indicate a bug - the parser should handle
         // all malformed input gracefully without throwing

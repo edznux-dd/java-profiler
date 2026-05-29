@@ -1,0 +1,1 @@
+start,event=cpu,file=/tmp/prof-%p.jfr

@@ -96,6 +96,8 @@ FrameDesc FrameDesc::no_dwarf_frame = {0, DW_REG_INVALID, DW_REG_INVALID, DW_REG
 void DwarfParser::init(const char *name, const char *image_base) {
   _name = name;
   _image_base = image_base;
+  _section_start = NULL;
+  _section_end = NULL;
 
   _capacity = 128;
   _count = 0;
@@ -109,9 +111,10 @@ void DwarfParser::init(const char *name, const char *image_base) {
 }
 
 DwarfParser::DwarfParser(const char *name, const char *image_base,
-                         const char *eh_frame_hdr) {
+                         const char *eh_frame_hdr, size_t eh_frame_hdr_size,
+                         EhFrameHdrTag) {
   init(name, image_base);
-  parse(eh_frame_hdr);
+  parse(eh_frame_hdr, eh_frame_hdr_size);
 }
 
 DwarfParser::DwarfParser(const char *name, const char *image_base,
@@ -130,7 +133,18 @@ static constexpr u8 omit_sign_bit_mask_low(u8 value) {
   return value & 0x7;
 }
 
-void DwarfParser::parse(const char *eh_frame_hdr) {
+void DwarfParser::parse(const char *eh_frame_hdr, size_t size) {
+  // Fixed .eh_frame_hdr header consumed here: version (1) + 3 encoding bytes +
+  // eh_frame_ptr (4) + fde_count at offset 8 (4), with the binary-search table
+  // starting at offset 16. Refuse anything too small to hold that, and bound
+  // every subsequent read to [eh_frame_hdr, eh_frame_hdr + size): the data
+  // comes from a memory-mapped ELF image that may be truncated or corrupt.
+  if (eh_frame_hdr == NULL || size < 16) {
+    return;
+  }
+  _section_start = eh_frame_hdr;
+  _section_end = eh_frame_hdr + size;
+
   u8 version = eh_frame_hdr[0];
   u8 eh_frame_ptr_enc = eh_frame_hdr[1];
   u8 fde_count_enc = eh_frame_hdr[2];
@@ -149,8 +163,23 @@ void DwarfParser::parse(const char *eh_frame_hdr) {
 
   int fde_count = *(int *)(eh_frame_hdr + 8);
   int *table = (int *)(eh_frame_hdr + 16);
+  // Each table entry is a pair of 4-byte values (8 bytes) after the 16-byte
+  // header; this loop reads the first value of each pair. Reject a count that
+  // would make the index walk read past the section. A negative count cannot
+  // be valid either.
+  if (fde_count < 0 || (size_t)fde_count > (size - 16) / 8) {
+    Log::warn("Truncated or invalid .eh_frame_hdr (fde_count=%d, size=%lu) in %s",
+              fde_count, (unsigned long)size, _name);
+    return;
+  }
   for (int i = 0; i < fde_count; i++) {
-    _ptr = eh_frame_hdr + table[i * 2];
+    const char *fde = eh_frame_hdr + table[i * 2];
+    // table[i*2] is an untrusted offset; skip entries that fall outside the
+    // section rather than letting parseFde() start from a wild pointer.
+    if (fde < _section_start || fde >= _section_end) {
+      continue;
+    }
+    _ptr = fde;
     parseFde();
   }
 }
@@ -161,7 +190,10 @@ void DwarfParser::parseEhFrame(const char *eh_frame, size_t size) {
   if (eh_frame == NULL || size < 4) {
     return;
   }
-  const char *section_end = eh_frame + size;
+  // Publish the read window so the get*/skip* helpers clamp to it.
+  _section_start = eh_frame;
+  _section_end = eh_frame + size;
+  const char *section_end = _section_end;
   _ptr = eh_frame;
 
   while (_ptr + 4 <= section_end) {
@@ -250,7 +282,7 @@ void DwarfParser::parseCie() {
 
   const char *cie_start = _ptr;
   _ptr += 5;
-  while (*_ptr++) {
+  while (_ptr < _section_end && *_ptr++) {
   }
   _code_align = getLeb();
   _data_align = getSLeb();
@@ -280,6 +312,12 @@ void DwarfParser::parseFde() {
 }
 
 void DwarfParser::parseInstructions(u32 loc, const char *end) {
+  // `end` is derived from an untrusted record length; never let it run past
+  // the section. Reads inside the loop are clamped by the get*/skip* helpers,
+  // but clamping here keeps the loop bound honest and _ptr in range.
+  if (end > _section_end) {
+    end = _section_end;
+  }
   const u32 code_align = _code_align;
   const int data_align = _data_align;
 
@@ -452,6 +490,9 @@ int DwarfParser::parseExpression() {
 
   u32 len = getLeb();
   const char *end = _ptr + len;
+  if (end > _section_end) {
+    end = _section_end;
+  }
 
   while (_ptr < end) {
     u8 op = get8();
@@ -499,13 +540,15 @@ int DwarfParser::parseExpression() {
 
 void DwarfParser::addRecord(u32 loc, u32 cfa_reg, int cfa_off, int fp_off,
                             int pc_off) {
-  // Sanity asserts to be able to pack those two values into one u32 vq
-  // Assert that the cfa_reg fits in 8 bits (0 to 255)
-  assert(cfa_reg <= 0xFF);
-
-  // Assert that the cfa_off fits in a 24-bit signed range.
-  // Signed 24-bit integer range: -2^23 (-8,388,608) to 2^23 - 1 (8,388,607)
-  assert(cfa_off >= -8388608 && cfa_off <= 8388607);
+  // cfa_reg and cfa_off are packed into a single u32 (cfa_off << 8 | cfa_reg),
+  // so cfa_reg must fit in 8 bits (0..255) and cfa_off in a signed 24-bit range
+  // (-2^23 .. 2^23-1). Well-formed compiler-generated DWARF always satisfies
+  // this, but a malformed or corrupt .eh_frame from an untrusted ELF may not.
+  // Rather than pack a truncated (wrong) descriptor, drop the record: the stack
+  // walker treats a missing entry for a PC the same as any other unwind miss.
+  if (cfa_reg > 0xFF || cfa_off < -8388608 || cfa_off > 8388607) {
+    return;
+  }
 
   // cfa_reg and cfa_off can be encoded to a single 32 bit value, considering the existing and supported systems
   u32 cfa = static_cast<u32>(cfa_off) << 8 | static_cast<u32>(cfa_reg & 0xff);

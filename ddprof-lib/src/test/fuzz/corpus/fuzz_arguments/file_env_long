@@ -1,0 +1,1 @@
+start,event=alloc,file=%{HOME}/%{FUZZ_LONG_VAR}.jfr

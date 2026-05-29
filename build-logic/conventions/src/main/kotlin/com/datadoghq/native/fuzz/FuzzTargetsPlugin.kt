@@ -103,7 +103,12 @@ class FuzzTargetsPlugin : Plugin<Project> {
                 val objDir = project.file("${project.layout.buildDirectory.get()}/obj/fuzz/$fuzzName")
                 val binDir = project.file("${project.layout.buildDirectory.get()}/bin/fuzz/$fuzzName")
                 val binary = project.file("$binDir/$fuzzName")
+                // Writable working corpus libFuzzer grows over time (gitignored).
                 val targetCorpusDir = File(corpusBaseDir, fuzzName)
+                // Read-only committed seed corpus, named after the source file
+                // (fuzz_<name>/). Passed as an additional input dir so the seeds
+                // are actually used; libFuzzer only writes to the first dir.
+                val seedCorpusDir = File(corpusBaseDir, fullName)
 
                 // Compile task
                 val compileTask = project.tasks.register("compileFuzz_$fuzzName", NativeCompileTask::class.java) {
@@ -149,8 +154,15 @@ class FuzzTargetsPlugin : Plugin<Project> {
                     }
 
                     executable = binary.absolutePath
+                    // First positional dir is the writable corpus; any further
+                    // dirs are read-only seed inputs. Include the committed
+                    // fuzz_<name>/ seeds when present.
+                    val corpusArgs = mutableListOf(targetCorpusDir.absolutePath)
+                    if (seedCorpusDir.isDirectory && seedCorpusDir != targetCorpusDir) {
+                        corpusArgs.add(seedCorpusDir.absolutePath)
+                    }
                     args(
-                        targetCorpusDir.absolutePath,
+                        *corpusArgs.toTypedArray(),
                         "-max_total_time=$duration",
                         "-artifact_prefix=${crashDir.absolutePath}/$fuzzName-",
                         "-print_final_stats=1"

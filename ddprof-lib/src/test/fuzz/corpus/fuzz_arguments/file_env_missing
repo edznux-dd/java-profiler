@@ -1,0 +1,1 @@
+start,file=/tmp/%{NONEXISTENT_VAR}/x-%p.jfr

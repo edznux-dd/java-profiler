@@ -1,0 +1,9 @@
+# libFuzzer writes machine-generated "interesting" inputs into a per-target
+# working directory named after the target (e.g. dwarf/, arguments/, buffer/,
+# stringDictionary/). Those are build artifacts and must NOT be committed.
+#
+# The committed seed corpora live in fuzz_<target>/ directories and are tracked
+# explicitly. Ignore every subdirectory except those.
+*/
+!fuzz_*/
+!.gitignore
