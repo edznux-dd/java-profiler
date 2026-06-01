@@ -30,6 +30,13 @@ class Symbols {
     static void clearParsingCaches();
     // Fast range check: does this PC lie in libc or libpthread?
     static bool isLibcOrPthreadAddress(uintptr_t pc);
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    // Fuzz-only entry point exposing the otherwise file-internal ELF symbol
+    // parser (ElfParser::parseFile) so a libFuzzer harness can drive it against
+    // an arbitrary on-disk ELF image. Not compiled into production builds.
+    static bool parseElfFileForFuzzing(CodeCache* cc, const char* file_name, bool use_debug);
+#endif
 };
 
 class UnloadProtection {
